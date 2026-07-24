@@ -2,9 +2,8 @@ name: Auto Download M3U
 
 on:
   schedule:
-    # 每 6 小时执行一次 (UTC)
     - cron: '0 */6 * * *'
-  workflow_dispatch:  # 支持手动触发
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,7 +11,6 @@ permissions:
 jobs:
   download:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -22,20 +20,33 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install curl_cffi
-        run: pip install curl_cffi
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install curl_cffi requests 2>&1 | tee install.log
+          echo "=== curl_cffi version ==="
+          python -c "import curl_cffi; print(curl_cffi.__version__)" || echo "curl_cffi not available"
+          echo "=== requests version ==="
+          python -c "import requests; print(requests.__version__)"
 
       - name: Download M3U
         env:
-          # 将 tk 存入 GitHub Secret，方便后续更新
           M3U_URL: ${{ secrets.M3U_URL || 'https://live.catvod.com/?tk=883bbb11b5989f9103c729fc6d0cfa45' }}
         run: python scripts/download.py
 
-      - name: Commit and push
+      - name: Check output
+        run: |
+          ls -lah output/
+          head -n 20 output/playlist.m3u || echo "File not found or empty"
+
+      - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add output/
-          # 只有文件变化时才提交
-          git diff --cached --quiet || git commit -m "Update M3U playlist - $(date -u '+%Y-%m-%d %H:%M UTC')"
-          git push
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update M3U playlist - $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
