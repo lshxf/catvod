@@ -21,53 +21,6 @@ def get_chrome_path():
             return p
     return None
 
-async def wait_for_page_load(tab, timeout=120):
-    """等待页面真正加载完成（有内容且不是空白）"""
-    print("Waiting for page content...")
-    for i in range(timeout):
-        await asyncio.sleep(1)
-        
-        try:
-            url = tab.url
-            title = await tab.evaluate("document.title") or ""
-        except Exception:
-            url = ""
-            title = ""
-        
-        # 每 5 秒打印一次状态
-        if (i + 1) % 5 == 0:
-            print(f"  [{i+1}s] URL: {url}, Title: {title}")
-        
-        # 跳过空白页
-        if not url or url == "about:blank":
-            continue
-        
-        # 如果还在 challenge 中，继续等待
-        t = title.lower()
-        if "moment" in t or "checking" in t or "challenge" in t:
-            continue
-        
-        # 检查 body 是否有内容
-        try:
-            body_text = await tab.evaluate("document.body ? document.body.innerText : ''") or ""
-            body_html = await tab.evaluate("document.body ? document.body.innerHTML : ''") or ""
-        except Exception:
-            body_text = ""
-            body_html = ""
-        
-        # 如果 body 有实际内容（超过 100 字符），认为页面加载完成
-        if len(body_text) > 100 or len(body_html) > 500:
-            print(f"  Page content loaded after {i+1}s ({len(body_text)} chars text, {len(body_html)} chars html)")
-            return True
-        
-        # 如果 title 不是 New Tab 且有内容，也认为加载完成
-        if title and title != "New Tab" and len(body_html) > 100:
-            print(f"  Page loaded after {i+1}s (title: {title})")
-            return True
-    
-    print("Timeout waiting for page content")
-    return False
-
 async def main():
     chrome_path = get_chrome_path()
     if not chrome_path:
@@ -84,62 +37,102 @@ async def main():
     try:
         print(f"Navigating to: {URL}")
         tab = await browser.get(URL)
-        
-        # 等待页面有内容
-        loaded = await wait_for_page_load(tab)
-        
-        # 如果第一次加载失败，尝试刷新
-        if not loaded:
-            print("First load failed, trying refresh...")
-            await tab.reload()
-            loaded = await wait_for_page_load(tab)
-        
-        if not loaded:
-            print("Page failed to load after refresh")
-            sys.exit(1)
 
-        # 额外等待让 JS 完全执行
-        await asyncio.sleep(5)
-        print("Extracting content...")
+        # 等待更长时间让页面完全加载
+        print("Waiting 15s for page to fully load...")
+        await asyncio.sleep(15)
 
+        # 获取各种信息
+        url = tab.url
+        title = await tab.evaluate("document.title") or "N/A"
+        html = await tab.get_content() or ""
+        body_text = await tab.evaluate("document.body ? document.body.innerText : 'NO BODY'") or "NO BODY"
+        
+        print(f"\n=== URL: {url}")
+        print(f"=== Title: {title}")
+        print(f"=== HTML length: {len(html)}")
+        print(f"=== Body innerText length: {len(body_text)}")
+        
+        # 打印 HTML 前 3000 字符，看看实际内容
+        print(f"\n=== HTML PREVIEW (first 3000 chars) ===")
+        print(html[:3000])
+        print("=== END PREVIEW ===\n")
+
+        # 检查 iframe
+        iframe_count = await tab.evaluate("document.querySelectorAll('iframe').length")
+        print(f"=== iframe count: {iframe_count}")
+
+        # 检查是否有 shadow DOM
+        shadow_hosts = await tab.evaluate("""
+            Array.from(document.querySelectorAll('*')).filter(el => el.shadowRoot).length
+        """)
+        print(f"=== Shadow DOM hosts: {shadow_hosts}")
+
+        # 检查所有文本内容（包括隐藏元素）
+        all_text = await tab.evaluate("""
+            document.documentElement.innerText || document.documentElement.textContent
+        """)
+        print(f"=== documentElement text length: {len(all_text or '')}")
+        if all_text:
+            print(f"=== documentElement text preview (first 1000 chars) ===")
+            print((all_text or "")[:1000])
+            print("=== END ===\n")
+
+        # 尝试多种方式找 M3U
         content = None
 
-        # 方法1：body 文本
-        try:
-            body_text = await tab.evaluate("document.body.innerText")
-            if body_text and "#EXTM3U" in body_text:
-                content = body_text
-                print("Method 1 success: body text")
-        except Exception as e:
-            print(f"Method 1 failed: {e}")
+        # 1. body innerText
+        if body_text and "#EXTM3U" in body_text:
+            content = body_text
+            print("Found M3U in body.innerText")
 
-        # 方法2：page source
-        if not content:
-            try:
-                source = await tab.get_content()
-                if "#EXTM3U" in source:
-                    import html
-                    text = re.sub(r'<[^>]+>', '', source)
-                    text = html.unescape(text)
-                    if "#EXTM3U" in text:
-                        content = text
-                        print("Method 2 success: page source")
-            except Exception as e:
-                print(f"Method 2 failed: {e}")
+        # 2. documentElement text
+        if not content and all_text and "#EXTM3U" in all_text:
+            content = all_text
+            print("Found M3U in documentElement text")
 
-        # 方法3：<pre> 标签
-        if not content:
-            try:
-                pre = await tab.query_selector("pre")
-                if pre:
-                    text = await pre.get_text()
-                    if "#EXTM3U" in text:
-                        content = text
-                        print("Method 3 success: <pre> tag")
-            except Exception as e:
-                print(f"Method 3 failed: {e}")
+        # 3. HTML 中直接找
+        if not content and "#EXTM3U" in html:
+            # 提取 M3U 部分
+            start = html.find("#EXTM3U")
+            # 找到 M3U 结束位置（可能在 </pre> 或 </body> 前）
+            end_markers = ["</pre>", "</body>", "</html>"]
+            end = len(html)
+            for marker in end_markers:
+                idx = html.find(marker, start)
+                if idx != -1 and idx < end:
+                    end = idx
+            content = html[start:end]
+            # 去掉 HTML 标签
+            content = re.sub(r'<[^>]+>', '', content)
+            import html as html_module
+            content = html_module.unescape(content)
+            print(f"Found M3U in raw HTML, extracted {len(content)} chars")
 
-        # 方法4：检查是否是文件下载
+        # 4. iframe
+        if not content and iframe_count > 0:
+            for i in range(iframe_count):
+                try:
+                    iframe_text = await tab.evaluate(f"""
+                        (function() {{
+                            var iframes = document.querySelectorAll('iframe');
+                            if (iframes[{i}]) {{
+                                try {{
+                                    return iframes[{i}].contentDocument.body.innerText;
+                                }} catch(e) {{ return 'CROSS_ORIGIN'; }}
+                            }}
+                            return 'NO_IFRAME';
+                        }})()
+                    """)
+                    print(f"  iframe[{i}] text length: {len(str(iframe_text))}")
+                    if iframe_text and "#EXTM3U" in str(iframe_text):
+                        content = str(iframe_text)
+                        print(f"Found M3U in iframe[{i}]")
+                        break
+                except Exception as e:
+                    print(f"  iframe[{i}] error: {e}")
+
+        # 5. 下载的文件
         if not content:
             m3u_files = (
                 glob.glob(os.path.join(DOWNLOAD_DIR, "*.m3u")) +
@@ -149,35 +142,26 @@ async def main():
                 latest = max(m3u_files, key=os.path.getctime)
                 with open(latest, "r", encoding="utf-8") as f:
                     content = f.read()
-                print(f"Method 4 success: downloaded file {latest}")
+                print(f"Found M3U in downloaded file: {latest}")
                 os.remove(latest)
 
-        # Debug
-        if not content:
-            print("DEBUG: Saving screenshot...")
-            try:
-                await tab.save_screenshot(os.path.join(DOWNLOAD_DIR, "debug.png"))
-            except Exception as e:
-                print(f"Screenshot failed: {e}")
-            
-            try:
-                title = await tab.evaluate("document.title")
-                url = tab.url
-                body = await tab.evaluate("document.body.innerText") or "empty"
-                html_len = len(await tab.get_content() or "")
-                print(f"Title: {title}")
-                print(f"URL: {url}")
-                print(f"Body: {body[:500]}")
-                print(f"HTML length: {html_len}")
-            except Exception as e:
-                print(f"Debug failed: {e}")
+        # 保存截图
+        try:
+            await tab.save_screenshot(os.path.join(DOWNLOAD_DIR, "debug.png"))
+            print("Screenshot saved")
+        except Exception as e:
+            print(f"Screenshot error: {e}")
 
         if content:
             with open(OUTPUT, "w", encoding="utf-8") as f:
                 f.write(content)
-            print(f"Success: {len(content)} bytes -> {OUTPUT}")
+            print(f"\nSuccess: {len(content)} bytes -> {OUTPUT}")
         else:
-            print("ERROR: No M3U content retrieved")
+            print("\nERROR: No M3U content found")
+            # 保存 HTML 用于离线分析
+            with open(os.path.join(DOWNLOAD_DIR, "debug.html"), "w", encoding="utf-8") as f:
+                f.write(html)
+            print("Saved debug.html for analysis")
             sys.exit(1)
 
     finally:
