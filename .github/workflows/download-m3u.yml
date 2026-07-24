@@ -20,24 +20,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Chromium & Python deps
         run: |
-          pip install --upgrade pip
-          pip install curl_cffi requests 2>&1 | tee install.log
-          echo "=== curl_cffi version ==="
-          python -c "import curl_cffi; print(curl_cffi.__version__)" || echo "curl_cffi not available"
-          echo "=== requests version ==="
-          python -c "import requests; print(requests.__version__)"
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium
+          pip install undetected-chromedriver
 
-      - name: Download M3U
+      - name: Download M3U via browser
         env:
           M3U_URL: ${{ secrets.M3U_URL || 'https://live.catvod.com/?tk=883bbb11b5989f9103c729fc6d0cfa45' }}
         run: python scripts/download.py
 
       - name: Check output
         run: |
-          ls -lah output/
-          head -n 20 output/playlist.m3u || echo "File not found or empty"
+          ls -lah output/ || true
+          head -n 10 output/playlist.m3u || echo "No output file"
 
       - name: Commit and push if changed
         run: |
