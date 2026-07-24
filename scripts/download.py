@@ -7,6 +7,8 @@ import subprocess
 import re
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 URL = os.environ.get("M3U_URL", "https://live.catvod.com/?tk=883bbb11b5989f9103c729fc6d0cfa45")
 OUTPUT = "output/playlist.m3u"
@@ -15,7 +17,6 @@ DOWNLOAD_DIR = os.path.abspath("output")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def get_chrome_info():
-    """查找 Chrome 路径并提取主版本号"""
     paths = ["/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"]
     for p in paths:
         if os.path.exists(p):
@@ -23,45 +24,53 @@ def get_chrome_info():
                 result = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=10)
                 version_str = result.stdout.strip()
                 print(f"Found Chrome: {p} -> {version_str}")
-                # 修复：从 "Chromium 150.0.7871.128 snap" 中提取版本号
                 match = re.search(r'(\d+)\.(\d+)\.(\d+)\.(\d+)', version_str)
                 if match:
                     major = int(match.group(1))
                     return p, major
-                else:
-                    print(f"Could not parse version from: {version_str}")
             except Exception as e:
                 print(f"Failed to get version from {p}: {e}")
                 continue
     return None, None
 
-def wait_for_challenge(driver, timeout=90):
-    """循环检测 CF challenge 是否完成"""
-    print("Waiting for Cloudflare challenge...")
+def navigate_and_wait(driver, url, timeout=120):
+    """导航到 URL 并等待页面加载完成"""
+    print(f"Navigating to: {url}")
+    driver.get(url)
+    
+    # 等待页面不再处于新标签页或 about:blank
     for i in range(timeout):
         time.sleep(1)
-        try:
-            title = (driver.title or "").lower()
-        except Exception:
-            title = ""
-        t = title.lower()
-        if "moment" not in t and "checking" not in t and "challenge" not in t and title.strip():
-            print(f"Challenge cleared after {i+1}s (title: {driver.title})")
-            return True
-        # 每 10 秒打印一次状态
-        if (i + 1) % 10 == 0:
-            print(f"  ... still waiting ({i+1}s), title: {driver.title}")
-    print(f"Timeout. Current title: {driver.title}")
+        current_url = driver.current_url
+        title = (driver.title or "").lower()
+        
+        # 如果还在新标签页，尝试重新导航
+        if current_url in ("about:blank", "chrome://newtab/", "chrome://new-tab-page/"):
+            if i % 5 == 0 and i > 0:
+                print(f"  Still on blank page ({i}s), retrying navigation...")
+                driver.get(url)
+            continue
+        
+        # 检查是否还在 CF challenge 中
+        if "moment" in title or "checking" in title or "challenge" in title:
+            if (i + 1) % 10 == 0:
+                print(f"  Still in CF challenge ({i+1}s), title: {driver.title}")
+            continue
+        
+        # 页面已加载且不是 challenge
+        print(f"Page loaded after {i+1}s (url: {current_url}, title: {driver.title})")
+        return True
+    
+    print(f"Navigation timeout. URL: {driver.current_url}, Title: {driver.title}")
     return False
 
 def main():
     chrome_path, chrome_major = get_chrome_info()
     if not chrome_path:
-        print("ERROR: No Chrome/Chromium found")
+        print("ERROR: No Chrome found")
         sys.exit(1)
 
     options = uc.ChromeOptions()
-    # 关键修复：不使用 headless，让 Chrome 在 Xvfb 中以有头模式运行
     options.headless = False
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -69,7 +78,6 @@ def main():
     options.add_argument("--window-size=1920,1080")
     options.binary_location = chrome_path
 
-    # 可选：代理配置
     proxy = os.environ.get("PROXY")
     if proxy:
         print(f"Using proxy: {proxy}")
@@ -84,26 +92,28 @@ def main():
     }
     options.add_experimental_option("prefs", prefs)
 
-    print(f"Launching undetected Chrome {chrome_major} in HEADED mode (via Xvfb)...")
+    print(f"Launching undetected Chrome {chrome_major} in HEADED mode...")
     driver = uc.Chrome(options=options, version_main=chrome_major)
 
     try:
-        driver.get(URL)
+        # 导航并等待
+        if not navigate_and_wait(driver, URL):
+            print("Navigation failed")
+            sys.exit(1)
 
-        # 等待 CF challenge 通过
-        challenge_passed = wait_for_challenge(driver)
-
-        # 即使 challenge 超时，也尝试获取内容（有时 title 没变但内容已加载）
-        time.sleep(3)
+        # 额外等待让页面完全稳定
+        time.sleep(5)
 
         content = None
+        current_url = driver.current_url
+        print(f"Current URL: {current_url}")
 
         # 方法1：页面直接显示 M3U 文本
         try:
             body_text = driver.execute_script("return document.body.innerText")
             if body_text and "#EXTM3U" in body_text:
                 content = body_text
-                print("Extracted from page body text")
+                print("Method 1 success: extracted from page body text")
         except Exception as e:
             print(f"Method 1 failed: {e}")
 
@@ -117,7 +127,7 @@ def main():
                 latest = max(m3u_files, key=os.path.getctime)
                 with open(latest, "r", encoding="utf-8") as f:
                     content = f.read()
-                print(f"Read downloaded file: {latest}")
+                print(f"Method 2 success: read downloaded file {latest}")
                 os.remove(latest)
 
         # 方法3：从 <pre> 标签提取
@@ -127,18 +137,37 @@ def main():
                 text = pre.text
                 if "#EXTM3U" in text:
                     content = text
-                    print("Extracted from <pre> tag")
+                    print("Method 3 success: extracted from <pre> tag")
             except Exception as e:
                 print(f"Method 3 failed: {e}")
+
+        # 方法4：从 page_source 中提取（有时 M3U 在 HTML 中）
+        if not content:
+            try:
+                source = driver.page_source
+                if "#EXTM3U" in source:
+                    # 尝试提取 body 中的纯文本
+                    import html
+                    # 简单提取：去掉 HTML 标签
+                    import re
+                    text = re.sub(r'<[^>]+>', '', source)
+                    text = html.unescape(text)
+                    if "#EXTM3U" in text:
+                        content = text
+                        print("Method 4 success: extracted from page source")
+            except Exception as e:
+                print(f"Method 4 failed: {e}")
 
         # Debug
         if not content:
             debug_png = os.path.join(DOWNLOAD_DIR, "debug.png")
             driver.save_screenshot(debug_png)
             print(f"Debug screenshot: {debug_png}")
-            print("Page title:", driver.title)
+            print(f"Page title: {driver.title}")
+            print(f"Current URL: {driver.current_url}")
             try:
-                print("Source preview:", driver.page_source[:500])
+                body = driver.execute_script("return document.body.innerText")[:500]
+                print(f"Body text preview: {body}")
             except Exception:
                 pass
 
