@@ -24,15 +24,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y chromium-browser xvfb
-          pip install undetected-chromedriver
+          pip install nodriver
 
-      - name: Download M3U via browser (headed mode with Xvfb)
+      - name: Download M3U via nodriver (CDP)
         env:
           M3U_URL: ${{ secrets.M3U_URL || 'https://live.catvod.com/?tk=883bbb11b5989f9103c729fc6d0cfa45' }}
-          # 如果有代理，在这里配置
-          # PROXY: ${{ secrets.PROXY_URL }}
         run: |
-          # 启动虚拟显示器
           export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &
           sleep 2
