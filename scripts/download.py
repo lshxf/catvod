@@ -21,6 +21,53 @@ def get_chrome_path():
             return p
     return None
 
+async def wait_for_page_load(tab, timeout=120):
+    """等待页面真正加载完成（有内容且不是空白）"""
+    print("Waiting for page content...")
+    for i in range(timeout):
+        await asyncio.sleep(1)
+        
+        try:
+            url = tab.url
+            title = await tab.evaluate("document.title") or ""
+        except Exception:
+            url = ""
+            title = ""
+        
+        # 每 5 秒打印一次状态
+        if (i + 1) % 5 == 0:
+            print(f"  [{i+1}s] URL: {url}, Title: {title}")
+        
+        # 跳过空白页
+        if not url or url == "about:blank":
+            continue
+        
+        # 如果还在 challenge 中，继续等待
+        t = title.lower()
+        if "moment" in t or "checking" in t or "challenge" in t:
+            continue
+        
+        # 检查 body 是否有内容
+        try:
+            body_text = await tab.evaluate("document.body ? document.body.innerText : ''") or ""
+            body_html = await tab.evaluate("document.body ? document.body.innerHTML : ''") or ""
+        except Exception:
+            body_text = ""
+            body_html = ""
+        
+        # 如果 body 有实际内容（超过 100 字符），认为页面加载完成
+        if len(body_text) > 100 or len(body_html) > 500:
+            print(f"  Page content loaded after {i+1}s ({len(body_text)} chars text, {len(body_html)} chars html)")
+            return True
+        
+        # 如果 title 不是 New Tab 且有内容，也认为加载完成
+        if title and title != "New Tab" and len(body_html) > 100:
+            print(f"  Page loaded after {i+1}s (title: {title})")
+            return True
+    
+    print("Timeout waiting for page content")
+    return False
+
 async def main():
     chrome_path = get_chrome_path()
     if not chrome_path:
@@ -29,50 +76,35 @@ async def main():
 
     print(f"Using Chrome: {chrome_path}")
 
-    # 启动浏览器（nodriver 会自动处理 CDP 连接）
     browser = await uc.start(
         browser_executable_path=chrome_path,
-        headless=False,  # 有头模式，配合 Xvfb
+        headless=False,
     )
 
     try:
         print(f"Navigating to: {URL}")
         tab = await browser.get(URL)
-
-        # 等待页面加载和 CF challenge
-        print("Waiting for page to load...")
-        for i in range(120):
-            await asyncio.sleep(1)
-            try:
-                title = await tab.evaluate("document.title")
-                url = tab.url
-            except Exception:
-                title = ""
-                url = ""
-            
-            t = (title or "").lower()
-            print(f"  [{i+1}s] URL: {url}, Title: {title}")
-            
-            # 如果还在 challenge 页面，继续等待
-            if "moment" in t or "checking" in t or "challenge" in t:
-                if (i + 1) % 10 == 0:
-                    print(f"  Still in CF challenge...")
-                continue
-            
-            # 如果页面已经加载完成（有实际内容且不是空白页）
-            if url and url != "about:blank" and "new-tab" not in url:
-                # 再等几秒让内容稳定
-                await asyncio.sleep(3)
-                break
-        else:
-            print("Timeout waiting for page")
+        
+        # 等待页面有内容
+        loaded = await wait_for_page_load(tab)
+        
+        # 如果第一次加载失败，尝试刷新
+        if not loaded:
+            print("First load failed, trying refresh...")
+            await tab.reload()
+            loaded = await wait_for_page_load(tab)
+        
+        if not loaded:
+            print("Page failed to load after refresh")
             sys.exit(1)
 
-        # 获取页面内容
+        # 额外等待让 JS 完全执行
+        await asyncio.sleep(5)
         print("Extracting content...")
+
         content = None
 
-        # 方法1：直接获取 body 文本
+        # 方法1：body 文本
         try:
             body_text = await tab.evaluate("document.body.innerText")
             if body_text and "#EXTM3U" in body_text:
@@ -81,12 +113,11 @@ async def main():
         except Exception as e:
             print(f"Method 1 failed: {e}")
 
-        # 方法2：获取 page source
+        # 方法2：page source
         if not content:
             try:
                 source = await tab.get_content()
                 if "#EXTM3U" in source:
-                    # 去掉 HTML 标签
                     import html
                     text = re.sub(r'<[^>]+>', '', source)
                     text = html.unescape(text)
@@ -96,7 +127,7 @@ async def main():
             except Exception as e:
                 print(f"Method 2 failed: {e}")
 
-        # 方法3：查找 <pre> 标签
+        # 方法3：<pre> 标签
         if not content:
             try:
                 pre = await tab.query_selector("pre")
@@ -108,24 +139,38 @@ async def main():
             except Exception as e:
                 print(f"Method 3 failed: {e}")
 
+        # 方法4：检查是否是文件下载
+        if not content:
+            m3u_files = (
+                glob.glob(os.path.join(DOWNLOAD_DIR, "*.m3u")) +
+                glob.glob(os.path.join(DOWNLOAD_DIR, "*.m3u8"))
+            )
+            if m3u_files:
+                latest = max(m3u_files, key=os.path.getctime)
+                with open(latest, "r", encoding="utf-8") as f:
+                    content = f.read()
+                print(f"Method 4 success: downloaded file {latest}")
+                os.remove(latest)
+
         # Debug
         if not content:
             print("DEBUG: Saving screenshot...")
             try:
                 await tab.save_screenshot(os.path.join(DOWNLOAD_DIR, "debug.png"))
-                print(f"Screenshot saved")
             except Exception as e:
                 print(f"Screenshot failed: {e}")
             
             try:
                 title = await tab.evaluate("document.title")
                 url = tab.url
-                body = await tab.evaluate("document.body.innerText")
+                body = await tab.evaluate("document.body.innerText") or "empty"
+                html_len = len(await tab.get_content() or "")
                 print(f"Title: {title}")
                 print(f"URL: {url}")
-                print(f"Body preview: {body[:500] if body else 'empty'}")
+                print(f"Body: {body[:500]}")
+                print(f"HTML length: {html_len}")
             except Exception as e:
-                print(f"Debug info failed: {e}")
+                print(f"Debug failed: {e}")
 
         if content:
             with open(OUTPUT, "w", encoding="utf-8") as f:
