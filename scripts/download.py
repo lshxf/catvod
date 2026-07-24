@@ -4,6 +4,7 @@ import time
 import shutil
 import glob
 import subprocess
+import re
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 
@@ -22,16 +23,20 @@ def get_chrome_info():
                 result = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=10)
                 version_str = result.stdout.strip()
                 print(f"Found Chrome: {p} -> {version_str}")
-                # 格式: Chromium 150.0.7871.128
-                version_num = version_str.split()[-1]
-                major = int(version_num.split(".")[0])
-                return p, major
+                # 修复：从 "Chromium 150.0.7871.128 snap" 中提取版本号
+                match = re.search(r'(\d+)\.(\d+)\.(\d+)\.(\d+)', version_str)
+                if match:
+                    major = int(match.group(1))
+                    return p, major
+                else:
+                    print(f"Could not parse version from: {version_str}")
             except Exception as e:
                 print(f"Failed to get version from {p}: {e}")
                 continue
     return None, None
 
-def wait_for_challenge(driver, timeout=60):
+def wait_for_challenge(driver, timeout=90):
+    """循环检测 CF challenge 是否完成"""
     print("Waiting for Cloudflare challenge...")
     for i in range(timeout):
         time.sleep(1)
@@ -39,9 +44,13 @@ def wait_for_challenge(driver, timeout=60):
             title = (driver.title or "").lower()
         except Exception:
             title = ""
-        if "moment" not in title and "checking" not in title and "challenge" not in title and title.strip():
+        t = title.lower()
+        if "moment" not in t and "checking" not in t and "challenge" not in t and title.strip():
             print(f"Challenge cleared after {i+1}s (title: {driver.title})")
             return True
+        # 每 10 秒打印一次状态
+        if (i + 1) % 10 == 0:
+            print(f"  ... still waiting ({i+1}s), title: {driver.title}")
     print(f"Timeout. Current title: {driver.title}")
     return False
 
@@ -52,12 +61,19 @@ def main():
         sys.exit(1)
 
     options = uc.ChromeOptions()
-    options.headless = True
+    # 关键修复：不使用 headless，让 Chrome 在 Xvfb 中以有头模式运行
+    options.headless = False
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.binary_location = chrome_path
+
+    # 可选：代理配置
+    proxy = os.environ.get("PROXY")
+    if proxy:
+        print(f"Using proxy: {proxy}")
+        options.add_argument(f'--proxy-server={proxy}')
 
     prefs = {
         "download.default_directory": DOWNLOAD_DIR,
@@ -68,16 +84,17 @@ def main():
     }
     options.add_experimental_option("prefs", prefs)
 
-    print(f"Launching undetected Chrome {chrome_major}...")
-    # 关键修复：传入 version_main 让 uc 下载匹配系统 Chrome 的 ChromeDriver
+    print(f"Launching undetected Chrome {chrome_major} in HEADED mode (via Xvfb)...")
     driver = uc.Chrome(options=options, version_main=chrome_major)
 
     try:
         driver.get(URL)
-        wait_for_challenge(driver)
 
-        # 额外等待页面稳定
-        time.sleep(5)
+        # 等待 CF challenge 通过
+        challenge_passed = wait_for_challenge(driver)
+
+        # 即使 challenge 超时，也尝试获取内容（有时 title 没变但内容已加载）
+        time.sleep(3)
 
         content = None
 
@@ -103,7 +120,7 @@ def main():
                 print(f"Read downloaded file: {latest}")
                 os.remove(latest)
 
-        # 方法3：<pre> 标签
+        # 方法3：从 <pre> 标签提取
         if not content:
             try:
                 pre = driver.find_element(By.TAG_NAME, "pre")
@@ -120,7 +137,10 @@ def main():
             driver.save_screenshot(debug_png)
             print(f"Debug screenshot: {debug_png}")
             print("Page title:", driver.title)
-            print("Source preview:", driver.page_source[:500])
+            try:
+                print("Source preview:", driver.page_source[:500])
+            except Exception:
+                pass
 
         if content:
             with open(OUTPUT, "w", encoding="utf-8") as f:
